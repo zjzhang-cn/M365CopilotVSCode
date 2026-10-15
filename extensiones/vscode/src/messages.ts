@@ -32,6 +32,12 @@ export interface FlattenOptions {
   readonly projectContext?: string;
   /** Las imágenes que van adjuntas al turno ({@link imagesOf}): el transcript las anuncia como tales. */
   readonly attachedImages?: ReadonlySet<unknown>;
+  /**
+   * Continuation of a conversation BizChat already holds: only the messages
+   * from `from` on go out (its own earlier replies are dropped — the service
+   * has them), and the standing instructions only when `instructions` is set.
+   */
+  readonly continuation?: { readonly from: number; readonly instructions: boolean };
 }
 
 /**
@@ -84,10 +90,11 @@ export function recentUserTexts(
 /**
  * BizChat/Sydney takes a single `message.text` string per turn and keeps its
  * own conversation state server-side by `ConversationId`. VS Code, however,
- * re-sends the entire transcript on every turn. The simplest robust bridge is
- * to open a fresh conversation each turn and flatten the whole transcript into
- * one prompt with role labels — the model then has full context without us
- * having to reconcile the two state models. How the transcript is squeezed
+ * re-sends the entire transcript on every turn. By default the whole
+ * transcript is flattened into one prompt with role labels, so every turn is
+ * a conversation of its own; the model picker's chat instead continues one
+ * BizChat conversation (chatSessions.ts) and uses `continuation` to send only
+ * the new messages. How the transcript is squeezed
  * into the budget (the request pinned, older tool results shortened) lives
  * in transcript.ts.
  */
@@ -95,7 +102,11 @@ export function flattenMessages(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
   options: FlattenOptions = {},
 ): string {
-  const transcript = renderTranscript(toTranscript(messages, options.attachedImages));
+  const continuation = options.continuation;
+  const all = toTranscript(messages, options.attachedImages);
+  const transcript = renderTranscript(
+    continuation ? all.slice(continuation.from).filter((m) => m.role !== "assistant") : all,
+  );
   if (!transcript) return "";
 
   // A short reminder placed AFTER the transcript — the last thing the model
@@ -112,12 +123,13 @@ export function flattenMessages(
     .filter(Boolean)
     .join("\n");
 
+  const standing = !continuation || continuation.instructions;
   return [
-    t("prompt.tone"),
-    t("prompt.markdown"),
-    options.skills ?? "",
-    catalog ? buildToolProtocolInstructions(catalog) : "",
-    options.environment ?? "",
+    continuation ? "" : t("prompt.tone"),
+    continuation ? "" : t("prompt.markdown"),
+    continuation ? "" : (options.skills ?? ""),
+    catalog && standing ? buildToolProtocolInstructions(catalog) : "",
+    continuation ? "" : (options.environment ?? ""),
     options.projectContext ?? "",
     transcript,
     reminder,
@@ -136,6 +148,7 @@ function toTranscript(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
   attachedImages: ReadonlySet<unknown> = new Set(),
 ): TranscriptMessage[] {
+	
   const callNames = new Map<string, string>();
   for (const message of messages) {
     for (const part of message.content) {

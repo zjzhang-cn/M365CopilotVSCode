@@ -11,6 +11,7 @@ import {
   type WebSource,
 } from "./client";
 import { debug, log } from "./logger";
+import { ChatSessions } from "./chatSessions";
 
 import { currentEnvironment, currentSkills } from "./editorContext";
 import { MarkdownStreamFormatter } from "./markdown";
@@ -54,6 +55,7 @@ export class M365CopilotProvider implements vscode.LanguageModelChatProvider, vs
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
   private readonly storeListener: vscode.Disposable;
+  private readonly sessions = new ChatSessions();
 
   constructor(
     private readonly store: ProfileStore,
@@ -148,18 +150,27 @@ export class M365CopilotProvider implements vscode.LanguageModelChatProvider, vs
     }
     debug(scope, `project context (${projectContext?.length ?? 0} chars)`, projectContext);
     // Screenshots pasted in the chat go with the turn, uploaded like the web app does.
-    const images = imagesOf(messages);
-    const prompt = flattenMessages(messages, {
-      catalog,
-      toolsRequired,
-      environment: currentEnvironment(),
-      skills: currentSkills(),
-      projectContext,
-      attachedImages: new Set(images),
-    });
+    // Direct chat with the model is one long BizChat conversation; a request
+    // that continues the previous one sends only what is new.
+    const toolsKey = [...catalog.callable.keys()].sort().join(",");
+    let session = this.sessions.plan(model.id, messages, toolsKey);
+    let images = imagesOf(messages.slice(session.from));
+    const flatten = (from: number, instructions: boolean) =>
+      flattenMessages(messages, {
+        catalog,
+        toolsRequired,
+        environment: currentEnvironment(),
+        skills: currentSkills(),
+        projectContext,
+        attachedImages: new Set(images),
+        continuation: from > 0 ? { from, instructions } : undefined,
+      });
+    let conversation = session.conversation;
+    let continued = session.continued;
+    let prompt = flatten(session.from, session.instructions);
     debug(
       scope,
-      `prompt flattened (${prompt.length} chars) — exactly what goes to BizChat as the user message`,
+      `prompt flattened (${prompt.length} chars, ${continued ? "continuing the conversation" : "new conversation"}) — exactly what goes to BizChat as the user message`,
       prompt,
     );
     log(
@@ -177,14 +188,17 @@ export class M365CopilotProvider implements vscode.LanguageModelChatProvider, vs
     );
     if (!prompt.trim()) {
       log(t("log.emptyPrompt"));
+      session.discard();
       return;
     }
 
     const controller = new AbortController();
     const markdown = new MarkdownStreamFormatter();
+    let shown = false;
     const emitMarkdown = (text: string) => {
       const formatted = markdown.push(text);
       if (formatted) {
+        shown = true;
         debug(scope, `→ text part to VS Code (${formatted.length} chars)`);
         progress.report(new vscode.LanguageModelTextPart(formatted));
       }
@@ -239,6 +253,7 @@ export class M365CopilotProvider implements vscode.LanguageModelChatProvider, vs
         return streamCopilotTurnWithRetry({
           profile,
           prompt: turnPrompt,
+          conversation,
           tone: selected?.tone ?? null,
           mode,
           signal: controller.signal,
@@ -290,7 +305,33 @@ export class M365CopilotProvider implements vscode.LanguageModelChatProvider, vs
     };
 
     try {
-      let turn = await attempt(prompt, toolsOffered);
+      let turn;
+      try {
+        turn = await attempt(prompt, toolsOffered);
+      } catch (error) {
+        // The service may have dropped the conversation: once more as a new one with the whole transcript.
+        const cancelled =
+          token.isCancellationRequested ||
+          (error instanceof CopilotClientError && error.message === "__CANCELLED__");
+        if (
+          !continued ||
+          shown ||
+          cancelled ||
+          error instanceof CopilotAuthError ||
+          (error instanceof CopilotClientError && isAccountLevelError(error))
+        ) {
+          throw error;
+        }
+        debug(scope, "the continued conversation failed; retrying as a new conversation", error);
+        session.discard();
+        session = this.sessions.plan(model.id, messages, toolsKey);
+        conversation = session.conversation;
+        continued = false;
+        images = imagesOf(messages);
+        prompt = flatten(0, true);
+        turn = await attempt(prompt, toolsOffered);
+      }
+      session.commit();
       // No tool call although tools were offered, and the reply gave up or
       // worked in M365's own sandbox: once more, with a note that says what is
       // true. What it wrote is dropped unseen (it was still held back).
@@ -327,6 +368,7 @@ export class M365CopilotProvider implements vscode.LanguageModelChatProvider, vs
         sources: sources.map((source) => source.url),
       }));
     } catch (error) {
+      session.discard();
       debug(scope, `request ended with an error after ${Date.now() - started} ms`, error);
       if (error instanceof CopilotClientError && error.message === "__CANCELLED__") {
         return; // user cancelled — swallow quietly
