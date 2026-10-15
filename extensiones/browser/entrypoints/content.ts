@@ -51,6 +51,17 @@ export default defineContentScript({
           logger.error("Error reenviando perfil al background:", err);
         });
       }
+
+      // Traza del resultado de una descarga de asyncgw pedida en la página.
+      if (data.kind === "DOWNLOAD_RESULT" && data.payload) {
+        const { ok, size, error } = data.payload as {
+          ok?: boolean;
+          size?: number;
+          error?: string;
+        };
+        if (ok) logger.info(`Descarga de asyncgw completada (${size ?? "?"} bytes)`);
+        else logger.warn(`Descarga de asyncgw fallida: ${error ?? "sin detalle"}`);
+      }
     });
 
     // El background pide re-escanear cuando el token está a punto de caducar.

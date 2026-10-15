@@ -2,10 +2,17 @@ import {
   CAPTURE_STORE_KEY,
   BRIDGE_MESSAGE_MARKER,
   COPILOT_CONTENT_MATCHES,
+  DOWNLOAD_PARAM,
+  IC3_STORE_KEY,
   SCAN_MISSING_MS,
+  acceptIc3Token,
   diagnoseToken,
+  downloadTarget,
+  filenameFromObjectUrl,
   inspectOutgoingFrames,
+  isAsyncgwObjectUrl,
   isCopilotSocketUrl,
+  isIc3Token,
   nextScan,
   normalizeEndpoint,
   sameCapture,
@@ -13,8 +20,10 @@ import {
   tokensInStorageValue,
   toneOfTemplate,
   withObservedTone,
+  withoutExpiredIc3,
   withoutExpiredToken,
   type CaptureStore,
+  type Ic3Record,
 } from "@m365copilot/core";
 import { logger } from "@/utils/logger";
 
@@ -100,6 +109,8 @@ export default defineContentScript({
 
     /** Si el token guardado caducó, lo descarta para invitar a recapturarlo. */
     function pruneExpiredToken(): void {
+      // El de Teams también se limpia: caducado sólo lleva a descargas 401.
+      if (!withoutExpiredIc3(readIc3())) localStorage.removeItem(IC3_STORE_KEY);
       const cleaned = withoutExpiredToken(readStore());
       if (!cleaned) return;
       cleaned.capturedAt = new Date().toISOString();
@@ -107,12 +118,17 @@ export default defineContentScript({
     }
 
     /** Guarda un token sólo si es de Sydney, válido y no más viejo que el que ya teníamos. */
-    function offerToken(token: string, where: string): void {
+    function offerToken(token: string, where: string, headers?: any): void {
       try {
         const { diagnosis, accepted } = diagnoseToken(readStore(), token);
         if (!accepted) {
           // `not-sydney` es de lo más normal (cada fetch a Graph trae su
-          // bearer), por eso sólo se registra en modo verboso.
+          // bearer)… pero entre esos descartes viaja el token de Teams (ic3),
+          // que no es de Sydney y aun así es imprescindible: es la llave que
+          // exige asyncgw para servir un fichero. Se prueba aparte antes de
+          // darse por vencido.
+          if (offerIc3Token(token, where, headers)) return;
+          // por eso sólo se registra en modo verboso.
           diag(`token descartado desde ${where}: ${diagnosis}`);
           return;
         }
@@ -121,6 +137,43 @@ export default defineContentScript({
         writeStore({ ...accepted, tokenSource: where });
       } catch (error) {
         logger.error(`Error al procesar token desde ${where}:`, error);
+      }
+    }
+
+    // --------------------------------------------- token de Teams (ic3)
+
+    /** El registro del token de Teams guardado aparte, o null. */
+    function readIc3(): Ic3Record | null {
+      try {
+        const stored = localStorage.getItem(IC3_STORE_KEY);
+        return stored ? (JSON.parse(stored) as Ic3Record) : null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * Guarda el token de Teams (ic3) aparte del perfil: no es de Sydney, pero
+     * es la llave que exige asyncgw para servir un fichero (ver download.ts en
+     * @m365copilot/core). Devuelve si el token era de Teams — se consumió
+     * aquí — para que quien llama no lo cuente como un descarte más.
+     */
+    function offerIc3Token(token: string, where: string, headers?: any): boolean {
+      if (!isIc3Token(token)) return false;
+      try {
+        const next = acceptIc3Token(readIc3(), token, {
+          product: headerValue(headers, "ms-ic3-product"),
+          clientVersion: headerValue(headers, "x-ms-client-version"),
+        });
+        if (next) {
+          next.capturedAt = new Date().toISOString();
+          localStorage.setItem(IC3_STORE_KEY, JSON.stringify(next));
+          diag(`token de Teams (ic3) actualizado desde ${where}`);
+        }
+        return true;
+      } catch (error) {
+        logger.error("Error al guardar el token de Teams (ic3):", error);
+        return true;
       }
     }
 
@@ -215,7 +268,9 @@ export default defineContentScript({
           if (!auth && typeof Request !== "undefined" && input instanceof Request) {
             auth = input.headers.get("authorization");
           }
-          if (auth && /^bearer /i.test(auth)) offerToken(auth.slice(7).trim(), "fetch-header");
+          if (auth && /^bearer /i.test(auth)) {
+            offerToken(auth.slice(7).trim(), "fetch-header", init && init.headers);
+          }
         } catch {
           /* ignorar */
         }
@@ -299,11 +354,98 @@ export default defineContentScript({
       });
     }
 
+    // ------------------------------------------------- descargas de asyncgw
+
+    /** Deja constancia en el puente del resultado de una descarga (queda en su traza). */
+    function reportDownload(result: {
+      url: string;
+      ok: boolean;
+      size?: number;
+      error?: string;
+    }): void {
+      try {
+        window.postMessage(
+          { [BRIDGE_MESSAGE_MARKER]: true, kind: "DOWNLOAD_RESULT", payload: result },
+          location.origin,
+        );
+      } catch {
+        /* la traza no es crítica */
+      }
+    }
+
+    /** Guarda el blob con el nombre dado (es lo que hace la web al descargar). */
+    function saveBlob(blob: Blob, filename: string): void {
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      anchor.style.display = "none";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      // El objeto sigue vivo el tiempo justo para que el navegador lo lea.
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    }
+
+    /**
+     * Descarga un objeto de asyncgw como lo haría la web: `fetch` en el
+     * contexto de la página (la cookie va sola) con el token de Teams
+     * capturado. Es la ÚNICA combinación que asyncgw acepta — desde fuera del
+     * navegador todo son 401 (ver la cabecera de download.ts).
+     */
+    async function handleDownloadRequest(target: unknown): Promise<void> {
+      if (!isAsyncgwObjectUrl(target)) {
+        logger.warn("Descarga rechazada: la URL no es de un objeto de asyncgw");
+        return;
+      }
+      const record = withoutExpiredIc3(readIc3());
+      if (!record) {
+        logger.warn("Descarga sin token de Teams: nada que enviar a asyncgw");
+        window.alert(
+          "[M365 Copilot] No Teams token captured yet.\n" +
+            "Open the Copilot web app and download a file there once, then try this link again.",
+        );
+        reportDownload({ url: target, ok: false, error: "no-ic3-token" });
+        return;
+      }
+      try {
+        const response = await fetch(target, {
+          credentials: "include",
+          headers: {
+            authorization: `Bearer ${record.token}`,
+            "ms-ic3-product": record.product || "Copilot",
+            ...(record.clientVersion ? { "x-ms-client-version": record.clientVersion } : {}),
+          },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        if (blob.size === 0) throw new Error("la respuesta llegó vacía");
+        const fallback = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+        const filename = filenameFromObjectUrl(target) ?? `copilot-file-${fallback}.bin`;
+        saveBlob(blob, filename);
+        logger.info(`Descarga completada: «${filename}» (${blob.size} bytes)`);
+        reportDownload({ url: target, ok: true, size: blob.size });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn("Descarga fallida:", message);
+        window.alert(`[M365 Copilot] Download failed: ${message}`);
+        reportDownload({ url: target, ok: false, error: message });
+      }
+    }
+
     // Peticiones del puente (mundo ISOLATED), que a su vez vienen del background.
     window.addEventListener("message", (event: MessageEvent) => {
       if (event.source !== window) return;
       const data: any = event.data;
       if (!data || data[BRIDGE_MESSAGE_MARKER] !== true) return;
+
+      // Descarga pedida por el puente (marcador en la URL → content script):
+      // se atiende aquí, en el mundo MAIN, que es el único contexto con el que
+      // asyncgw coopera.
+      if (data.kind === "DOWNLOAD_FILE" && typeof data.payload?.url === "string") {
+        void handleDownloadRequest(data.payload.url);
+        return;
+      }
 
       // Renovación pedida desde el background: mirar otra vez la caché de MSAL y
       // republicar lo que haya, aunque no haya cambiado — así el background
@@ -326,6 +468,29 @@ export default defineContentScript({
     const existing = readStore();
     if (existing.accessToken) {
       setTimeout(() => postProfile(existing), 500);
+    }
+
+    // Marcador de descarga (`?m365copilot-download=<objeto>`): la regla DNR de
+    // la extensión (wxt.config.base.ts) redirige aquí las navegaciones a
+    // asyncgw, y este mundo lo atiende en cuanto arranca — sin depender del
+    // orden en que se inyectan los dos content scripts. Sólo el mundo MAIN
+    // puede hacerlo: es el contexto que asyncgw acepta.
+    const marked = downloadTarget(location.href);
+    if (marked) {
+      logger.info("Descarga de asyncgw pedida desde esta pestaña");
+      // El marcador se retira ya: recargar la página no repite la descarga.
+      try {
+        const clean = new URL(location.href);
+        clean.searchParams.delete(DOWNLOAD_PARAM);
+        history.replaceState(history.state, "", clean.toString());
+      } catch {
+        /* quitar el marcador es cosmético; la descarga sigue igual */
+      }
+      // En document_start puede que `document.body` aún no exista, y guardar
+      // el blob necesita un ancla en el documento.
+      const start = () => void handleDownloadRequest(marked);
+      if (document.body) start();
+      else document.addEventListener("DOMContentLoaded", start, { once: true });
     }
   },
 });

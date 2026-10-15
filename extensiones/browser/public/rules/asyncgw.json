@@ -1,0 +1,16 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "redirect",
+      "redirect": {
+        "regexSubstitution": "https://m365.cloud.microsoft/chat/?m365copilot-download=\\1"
+      }
+    },
+    "condition": {
+      "regexFilter": "^(https://[a-z0-9-]+\\.asyncgw\\.teams\\.microsoft\\.com/v1/objects/[A-Za-z0-9_-]+/views/original(?:/[^?#]*)?)$",
+      "resourceTypes": ["main_frame"]
+    }
+  }
+]

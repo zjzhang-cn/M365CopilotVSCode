@@ -7,6 +7,7 @@ import type { ConfigEnv, UserManifest } from "wxt";
 // con «Cannot find module». El cargador de la config (jiti) sí sabe leer
 // TypeScript, así que el fuente funciona siempre y sigue habiendo una única
 // fuente de verdad para la lista de dominios.
+import { ASYNCGW_HOST_PERMISSION } from "../../packages/core/src/constants";
 import { MICROSOFT_HOST_PERMISSIONS } from "../../packages/core/src/signOut";
 
 /**
@@ -79,7 +80,30 @@ export const FIREFOX_ADDON_ID = "m365-copilot-vscode@cristiancastineiras.github.
  * (Edge Partner Center lo rechaza o ignora), así que sólo va en Firefox.
  */
 export function manifestFor({ browser }: ConfigEnv): UserManifest {
-  if (browser !== "firefox") return sharedManifest;
+  if (browser !== "firefox") {
+    // Chrome y Edge (MV3). La descarga de los ficheros que Copilot genera y
+    // enlaza en el chat (objetos de asyncgw) necesita una regla DNR que
+    // redirija la navegación hacia el objeto como
+    // `…/chat/?m365copilot-download=<objeto>`: en esa página el interceptor
+    // (mundo MAIN) la ejecuta de verdad, que es el único contexto que asyncgw
+    // acepta (ver download.ts en @m365copilot/core). Sin la regla, quien
+    // cliquea un enlace a asyncgw sólo ve 401/404.
+    //
+    // `declarativeNetRequestWithHostAccess` (en vez del permiso DNR completo)
+    // limita la regla a los hosts concedidos: el aviso de instalación no gana
+    // nada nuevo respecto a las host permissions que ya hay.
+    return {
+      ...sharedManifest,
+      permissions: [...(sharedManifest.permissions ?? []), "declarativeNetRequestWithHostAccess"],
+      host_permissions: [...(sharedManifest.host_permissions ?? []), ASYNCGW_HOST_PERMISSION],
+      declarative_net_request: {
+        rule_resources: [
+          // El JSON vive en public/rules/: WXT lo copia tal cual a la raíz del build.
+          { id: "asyncgw-download", enabled: true, path: "rules/asyncgw.json" },
+        ],
+      },
+    } as UserManifest;
+  }
   return {
     ...sharedManifest,
     browser_specific_settings: {

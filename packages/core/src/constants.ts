@@ -59,6 +59,21 @@ export const COPILOT_CONTENT_MATCHES = [
 export const CAPTURE_STORE_KEY = "m365copilot.capture.v1";
 
 /**
+ * Clave de localStorage donde el interceptor guarda el token de Teams (ic3)
+ * aparte de la captura: no entra en el perfil de Copilot (no es de Sydney),
+ * pero es la llave que exige asyncgw para servir una descarga de fichero.
+ */
+export const IC3_STORE_KEY = "m365copilot.ic3.v1";
+
+/**
+ * Host de descarga de objetos de Copilot (asyncgw). La extensión de navegador
+ * necesita permiso sobre él para su regla DNR, que redirige las navegaciones a
+ * un objeto hacia la URL marcada con `m365copilot-download` — asyncgw no sirve
+ * nada fuera del contexto de una página con sesión (ver download.ts).
+ */
+export const ASYNCGW_HOST_PERMISSION = "*://*.asyncgw.teams.microsoft.com/*";
+
+/**
  * Marcador de los mensajes `window.postMessage` entre el interceptor (mundo
  * MAIN) y el puente (mundo ISOLATED) de la extensión de navegador.
  */
