@@ -42,10 +42,13 @@ GET /v1/objects/<id>/views/original
 authorization: Bearer <ic3 令牌>
 ms-cv: <随机 UUID，每请求一个>
 ms-ic3-product: Copilot
-x-ms-client-version: 2.20261014.16.0
+x-ms-client-version: 2.20261015.7.0    ← 随网页发布更新（前一天为 2.20261014.16.0）
+cache-control: no-cache                ← 页面显式设置
+pragma: no-cache                       ← 页面显式设置
+priority: u=1, i                       ← 页面显式设置（fetch priority）
 ```
 
-（`mode: cors`、`credentials: include`、Referer 由浏览器默认策略自动带 `https://m365.cloud.microsoft/`。）
+（`mode: cors`、`credentials: include`、Referer 由浏览器默认策略自动带 `https://m365.cloud.microsoft/`；`accept`/`accept-language` 浏览器自动补。两次抓包（10-15、10-16 各一次）交叉确认：`ms-cv` 每请求随机、`x-ms-client-version` 随网页版本推进、`cache-control`/`pragma`/`priority` 为页面显式设置。）
 
 ## 3. 原因分析
 
@@ -63,7 +66,7 @@ asyncgw 的认证设计把请求绑定到**浏览器会话上下文**，而不�
 
 ### 3.3 两道"时钟"（时效性）
 
-- **ic3 token 寿命 ~87 分钟**（抓包实例：`exp - iat = 5207s`）。比 Sydney token（~8h）短得多。token 过期后需要页面重新活动（一次下载/请求）来刷新捕获。
+- **ic3 token 寿命 ~87 分钟**（两次抓包实例：`exp - iat` 分别为 5207s 与 5269s）。比 Sydney token（~8h）短得多。token 过期后需要页面重新活动（一次下载/请求）来刷新捕获。
 - **对象寿命 ~8 小时**（实测：约 8 小时前的对象返回 404，被服务端清理）。过期对象任何凭据都无法取回。
 
 结论：**捕获 token → 拿到链接 → 下载**要在时间窗内完成；两条时间线相互独立（token 可以反复刷新，对象不能复活）。
@@ -157,7 +160,7 @@ DNR 重定向 → chat 页标记 → MAIN world fetch → 文件落地
 
 对照抓包请求，当前实现还有 4 处可加固（均未实施）：
 
-1. **补 `ms-cv`**：网页每请求带随机 UUID，我们未带（纯追踪头，低风险）。一行 `crypto.randomUUID()` 即可与网页逐字节对齐；
+1. **请求头对齐**：补 `ms-cv`（随机 UUID，一行 `crypto.randomUUID()`）；可选补 `cache-control: no-cache` + `pragma: no-cache`（页面显式设置，兼防中间缓存旧响应）；
 2. **文件名优先 `Content-Disposition`**：抓包 URL 形态为 `/views/original`（无文件名）时，现在会 fallback 成 `copilot-file-<时间戳>.bin`；响应头里的真实文件名若被 CORS expose 应优先解析；
 3. **redirect/非二进制响应防御**：会话过期时 fetch 可能跟到登录页返回 HTML（200）→ 存成垃圾 .bin。`response.redirected` / content-type 检查后明确报"会话过期"；
 4. **时效文案**：alert 说明 ic3 token ~87 分钟寿命，引导"去网页端下载一次再回来"。
